@@ -12,7 +12,7 @@ Env vars (all optional, set in Render dashboard):
     PORT              set automatically by Render
 """
 
-import os, json, threading, time, datetime, warnings
+import os, json, threading, time, datetime, warnings, gc
 import requests, xml.etree.ElementTree as ET
 import numpy as np
 from scipy.interpolate import griddata
@@ -24,8 +24,6 @@ import matplotlib.pyplot as plt
 import matplotlib.patheffects as mpe
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
-import cartopy.io.shapereader as shpreader
-from shapely.ops import unary_union
 from flask import Flask, send_from_directory, jsonify, Response
 
 warnings.filterwarnings("ignore")
@@ -35,8 +33,8 @@ warnings.filterwarnings("ignore")
 # ---------------------------------------------------------------------
 
 UPDATE_INTERVAL = int(os.environ.get("UPDATE_SECONDS", 600))   # 10 min default
-DPI             = 150                                          # was 200 on desktop
-GRID_STEP       = 0.007                                        # was 0.004 on desktop (coarser = lighter)
+DPI             = 110                                          # was 150, then 200 on desktop
+GRID_STEP       = 0.01                                         # was 0.007, then 0.004 on desktop (coarser = lighter)
 SIGMA           = 2.0
 
 _EXTENT_EE   = [21.3, 28.7, 57.3, 60.05]
@@ -236,8 +234,8 @@ def fetch():
 
 
 def make_grid():
-    lons = np.arange(EXTENT[0], EXTENT[1] + GRID_STEP, GRID_STEP)
-    lats = np.arange(EXTENT[2], EXTENT[3] + GRID_STEP, GRID_STEP)
+    lons = np.arange(EXTENT[0], EXTENT[1] + GRID_STEP, GRID_STEP, dtype=np.float32)
+    lats = np.arange(EXTENT[2], EXTENT[3] + GRID_STEP, GRID_STEP, dtype=np.float32)
     return np.meshgrid(lons, lats)
 
 
@@ -249,31 +247,7 @@ def interpolate(stations, key, gx, gy):
     zi  = griddata(pts, vs, (gx, gy), method="linear")
     znn = griddata(pts, vs, (gx, gy), method="nearest")
     zi  = np.where(np.isnan(zi), znn, zi)
-    return gaussian_filter(zi, sigma=SIGMA)
-
-
-_SHPCACHE = {}
-
-def _get_country_geoms(iso_keep_tuple):
-    if iso_keep_tuple in _SHPCACHE:
-        return _SHPCACHE[iso_keep_tuple]
-    iso_keep = set(iso_keep_tuple)
-    shp_path = shpreader.natural_earth(resolution="10m", category="cultural",
-                                       name="admin_0_countries")
-    reader = shpreader.Reader(shp_path)
-    keep_geoms, other_geoms = [], []
-    for rec in reader.records():
-        iso  = rec.attributes.get("ISO_A2", "")
-        iso2 = rec.attributes.get("ADM0_A3", "")
-        geom = rec.geometry
-        if iso in iso_keep or iso2 in iso_keep:
-            keep_geoms.append(geom)
-        else:
-            other_geoms.append(geom)
-    keep_union  = unary_union(keep_geoms)  if keep_geoms  else None
-    other_union = unary_union(other_geoms) if other_geoms else None
-    _SHPCACHE[iso_keep_tuple] = (keep_union, other_union)
-    return keep_union, other_union
+    return gaussian_filter(zi, sigma=SIGMA).astype(np.float32)
 
 
 _PE  = [mpe.withStroke(linewidth=3, foreground="white")]
@@ -295,22 +269,20 @@ def render_one(stations, key, cmap, norm, title, unit, fmt,
         s_min = s_max = None
 
     if EXTENT == _EXTENT_EE:
-        iso_keep = ("EE",); region_label = "Eesti"
+        region_label = "Eesti"
         credits = "Andmeallikas: EMHI vaatlusjaamad  •  ilmateenistus.ee"
     elif EXTENT == _EXTENT_LV:
-        iso_keep = ("LV",); region_label = "Läti"
+        region_label = "Läti"
         credits = "Andmeallikas: LVĢMC / Open-Meteo  •  open-meteo.com"
     elif EXTENT == _EXTENT_LT:
-        iso_keep = ("LT",); region_label = "Leedu"
+        region_label = "Leedu"
         credits = "Andmeallikas: LHMT / Open-Meteo  •  open-meteo.com"
     else:
-        iso_keep = ("EE", "LV", "LT"); region_label = "Eesti + Läti + Leedu"
+        region_label = "Eesti + Läti + Leedu"
         credits = ("Andmeallikas: EMHI (ilmateenistus.ee)  •  "
                    "LVĢMC / LHMT / Open-Meteo (open-meteo.com)")
 
-    keep_union, other_union = _get_country_geoms(iso_keep)
-
-    fig = plt.figure(figsize=(16, 11), facecolor="white", dpi=DPI)
+    fig = plt.figure(figsize=(12, 8.5), facecolor="white", dpi=DPI)
     ax  = fig.add_axes([0.04, 0.06, 0.82, 0.88], projection=ccrs.PlateCarree())
     ax.set_extent(EXTENT, crs=ccrs.PlateCarree())
     ax.set_facecolor("white")
@@ -321,11 +293,8 @@ def render_one(stations, key, cmap, norm, title, unit, fmt,
                       shading="auto", transform=ccrs.PlateCarree(),
                       rasterized=True, zorder=2)
 
-    ax.add_feature(cfeature.OCEAN.with_scale("10m"), facecolor="white", zorder=3)
-    if other_union is not None:
-        ax.add_geometries([other_union], ccrs.PlateCarree(),
-                          facecolor="white", edgecolor="none", zorder=3)
-    ax.add_feature(cfeature.LAKES.with_scale("10m"),
+    ax.add_feature(cfeature.OCEAN.with_scale("50m"), facecolor="white", zorder=3)
+    ax.add_feature(cfeature.LAKES.with_scale("50m"),
                    facecolor="white", edgecolor="#666666", linewidth=0.5, zorder=4)
 
     if isobars and grid is not None:
@@ -337,11 +306,11 @@ def render_one(stations, key, cmap, norm, title, unit, fmt,
                         transform=ccrs.PlateCarree(), zorder=6)
         ax.clabel(cs, inline=True, fontsize=6.5, fmt="%d", inline_spacing=4)
 
-    ax.coastlines(resolution="10m", linewidth=1.1, color="#222222", zorder=7)
-    ax.add_feature(cfeature.BORDERS.with_scale("10m"),
+    ax.coastlines(resolution="50m", linewidth=1.1, color="#222222", zorder=7)
+    ax.add_feature(cfeature.BORDERS.with_scale("50m"),
                    linestyle="-", edgecolor="#333333", linewidth=0.9, zorder=7)
     admin1 = cfeature.NaturalEarthFeature("cultural", "admin_1_states_provinces_lines",
-                                          "10m", facecolor="none",
+                                          "50m", facecolor="none",
                                           edgecolor="#555555", linewidth=0.5)
     ax.add_feature(admin1, zorder=7)
 
@@ -434,6 +403,8 @@ def run_once():
             except Exception as e:
                 import traceback; traceback.print_exc()
                 print(f"  Error {fname}: {e}")
+            finally:
+                gc.collect()
 
         status = {
             "generated_utc": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
