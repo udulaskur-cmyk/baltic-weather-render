@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: baltic-weather-render
+    env: docker
+    plan: free
+    healthCheckPath: /
+    envVars:
+      - key: MAPS_REGION
+        value: EE_LV_LT
+      - key: UPDATE_SECONDS
+        value: "600"
